@@ -1,0 +1,22 @@
+# 构建产物
+build/
+build_*/
+managed_components/
+
+# 含真实 WiFi 账号密码，不上传
+main/wifi_config.h
+
+# 本地备份的测试代码
+backup/
+
+# 编辑器与系统文件
+.vscode/
+.vs/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# ESP-IDF 生成文件
+sdkconfig.old
+dependencies.lock

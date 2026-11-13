@@ -1,0 +1,8 @@
+#pragma once
+/* 使用说明：
+ *   1. 把本文件复制一份，重命名为 wifi_config.h
+ *   2. 填入你自己的 WiFi 名称和密码
+ *   3. wifi_config.h 已被 .gitignore 忽略，不会被提交
+ */
+#define WIFI_SSID "your-wifi-ssid"
+#define WIFI_PASS "your-wifi-password"
