@@ -9,6 +9,10 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 #include "lcd.h"
 #include "lv_port_disp_template.h"
@@ -47,6 +51,23 @@ static const char *TAG = "main output";
 // 有源蜂鸣器模块（S8050 驱动，高电平触发）I/O 接 GPIO7
 #define BUZZER_PIN GPIO_NUM_7
 
+// 4 线火焰传感器：DO 数字量接 GPIO2（低电平=检测到火焰），AO 模拟量接 GPIO1
+#define FLAME_DO_PIN GPIO_NUM_2
+#define FLAME_AO_CH  ADC_CHANNEL_0     /* ESP32-S3 的 ADC1_CH0 对应 GPIO1 */
+
+// SG90 舵机 x2（报警时开窗）：窗A 信号接 GPIO8，窗B 信号接 GPIO9
+#define SERVO_A_PIN GPIO_NUM_8
+#define SERVO_B_PIN GPIO_NUM_9
+#define SERVO_A_CH  LEDC_CHANNEL_0
+#define SERVO_B_CH  LEDC_CHANNEL_1
+#define SERVO_TM    LEDC_TIMER_0
+#define SERVO_MODE  LEDC_LOW_SPEED_MODE
+#define SERVO_RES   LEDC_TIMER_13_BIT      /* 2^13 = 8192 级 */
+#define SERVO_HZ    50                     /* 舵机标准 50Hz，周期 20ms */
+#define SERVO_DUTY_MAX 8192
+#define WIN_CLOSE_DEG  0                   /* 关窗角度 */
+#define WIN_OPEN_DEG   90                  /* 开窗角度 */
+
 TaskHandle_t  task_handle_gui;
 esp_timer_create_args_t timer_args_gui;
 esp_timer_handle_t timer_handle_gui;
@@ -56,6 +77,9 @@ extern MY_WIFI_INFO my_wifi_info;
 extern MY_ETH_INFO my_eth_info;
 extern MY_SDCARD_INFO my_SDcard_info;
 extern MY_MQTT_INFO my_mqtt_info;
+
+static adc_oneshot_unit_handle_t s_adc;
+static adc_cali_handle_t         s_adc_cali = NULL;
 
 static void lv_tick_task(void *arg)
 {
@@ -67,6 +91,97 @@ void lv_run_task(void *arg)
         lv_task_handler();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+/* 设置单路舵机角度：0~180 度 */
+static void servo_set_angle(ledc_channel_t ch, int deg)
+{
+    if (deg < 0)   deg = 0;
+    if (deg > 180) deg = 180;
+
+    /* 500us -> 0°，2500us -> 180° */
+    uint32_t pulse_us = 500 + (uint32_t)deg * 2000 / 180;
+    uint32_t duty = (uint32_t)((uint64_t)pulse_us * SERVO_DUTY_MAX / 20000);
+
+    ledc_set_duty(SERVO_MODE, ch, duty);
+    ledc_update_duty(SERVO_MODE, ch);
+}
+
+/* 两扇窗统一动作 */
+static void window_set(int deg)
+{
+    servo_set_angle(SERVO_A_CH, deg);
+    servo_set_angle(SERVO_B_CH, deg);
+    ESP_LOGI(TAG, "窗户 -> %s（%d 度）", deg > 0 ? "开窗" : "关窗", deg);
+}
+
+/* 双舵机初始化：两路共用 1 个 50Hz 定时器 */
+static void servo_init(void)
+{
+    ledc_timer_config_t timer_conf = {
+        .speed_mode      = SERVO_MODE,
+        .timer_num       = SERVO_TM,
+        .duty_resolution = SERVO_RES,
+        .freq_hz         = SERVO_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+
+    ledc_channel_config_t ch_conf = {
+        .gpio_num   = SERVO_A_PIN,
+        .speed_mode = SERVO_MODE,
+        .channel    = SERVO_A_CH,
+        .timer_sel  = SERVO_TM,
+        .duty       = 0,
+        .hpoint     = 0,
+        .intr_type  = LEDC_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_conf));
+
+    ch_conf.gpio_num = SERVO_B_PIN;
+    ch_conf.channel  = SERVO_B_CH;
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_conf));
+
+    window_set(WIN_CLOSE_DEG);   // 上电先关窗
+    ESP_LOGI(TAG, "双舵机初始化完成 A=GPIO%d B=GPIO%d（初始关窗）", SERVO_A_PIN, SERVO_B_PIN);
+}
+
+/* 火焰传感器初始化：DO 数字输入 + AO 模拟输入 */
+static void flame_init(void)
+{
+    gpio_config_t flame_conf = {
+        .pin_bit_mask = (1ULL << FLAME_DO_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&flame_conf);
+
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, FLAME_AO_CH, &chan_cfg));
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali) != ESP_OK) {
+        s_adc_cali = NULL;
+    }
+#endif
+
+    ESP_LOGI(TAG, "火焰传感器初始化完成 DO=GPIO%d AO=GPIO1", FLAME_DO_PIN);
 }
 
 void app_main(void)
@@ -149,6 +264,13 @@ void app_main(void)
     gpio_config(&buzzer_conf);
     gpio_set_level(BUZZER_PIN, 0);   // 初始静音
     ESP_LOGI(TAG, "蜂鸣器初始化完成，信号脚 GPIO%d", BUZZER_PIN);
+
+    // 火焰传感器初始化（DO=GPIO2 / AO=GPIO1）
+    flame_init();
+
+    // 双舵机初始化（报警时开窗）
+    servo_init();
+
     // 以下官方工厂测试函数已注释：无 SD 卡时 app_sd_card 会阻塞导致看门狗复位
     // app_eth();
     // app_sd_card();
@@ -158,6 +280,9 @@ void app_main(void)
     int alarm_state = -1;   // 上一次的报警状态：-1=未初始化，0=正常，1=报警
     int beep_tick = 0;      // 蜂鸣器间歇鸣叫计时
     int beep_on = 0;        // 蜂鸣器当前是否在响
+    int ao_tick = 0;        // 火焰 AO 采样分频
+    int ao_mv = 0;          // 火焰 AO 电压（mV）
+
     while (true) {
         // 读取 K230 发来的安全帽检测结果
         int hat = app_uart_get_hat();
@@ -167,32 +292,63 @@ void app_main(void)
         int mq2_raw = gpio_get_level(MQ2_PIN);
         // 1=烟雾报警（真实传感器，低电平有效）
         int smoke = (mq2_raw == 0) ? 1 : 0;
+        // 读取火焰传感器 DO：0=检测到火焰，1=正常
+        int flame_do = gpio_get_level(FLAME_DO_PIN);
+        int flame = (flame_do == 0) ? 1 : 0;
 
-        // ===== 报警联动：MQ-2 是唯一触发源 =====
-        if (smoke != alarm_state) {
-            alarm_state = smoke;
-            if (smoke) {
-                // 有烟雾：红灯常亮 + 绿灯灭 + 风扇开 + 蜂鸣器响
+        // 火焰 AO 每 100ms 采一次（只用于日志观察强弱，报警判断仍用 DO）
+        ao_tick++;
+        if (ao_tick >= 10) {
+            ao_tick = 0;
+            int ao_raw = 0;
+            adc_oneshot_read(s_adc, FLAME_AO_CH, &ao_raw);
+            if (s_adc_cali) {
+                adc_cali_raw_to_voltage(s_adc_cali, ao_raw, &ao_mv);
+            }
+        }
+
+        // ===== 报警联动：火焰优先 =====
+        //   2 = 检测到火焰（红灯 + 蜂鸣器）
+        //   1 = 只检测到烟雾（绿灯，蜂鸣器不响）
+        //   0 = 正常（灯不亮，蜂鸣器不响）
+        int alarm = flame ? 2 : (smoke ? 1 : 0);
+
+        if (alarm != alarm_state) {
+            alarm_state = alarm;
+            if (alarm == 2) {
+                // 火焰：红灯亮 + 绿色灭 + 蜂鸣器响 + 风扇开 + 开窗
                 gpio_set_level(LED_R_PIN, 1);
                 gpio_set_level(LED_G_PIN, 0);
                 gpio_set_level(FAN_PIN, 1);
                 gpio_set_level(BUZZER_PIN, 1);
+                window_set(WIN_OPEN_DEG);
                 beep_tick = 0;
                 beep_on = 1;
-                ESP_LOGI(TAG, "【报警】检测到烟雾 -> 红灯亮 风扇开 蜂鸣器响");
+                ESP_LOGW(TAG, "【火焰报警】烟雾=%d 火焰=%d -> 红灯亮 蜂鸣器响 风扇开 开窗",
+                         smoke, flame);
+            } else if (alarm == 1) {
+                // 只有烟雾：绿灯亮 + 红色灭 + 蜂鸣器静音 + 风扇开 + 开窗
+                gpio_set_level(LED_R_PIN, 0);
+                gpio_set_level(LED_G_PIN, 1);
+                gpio_set_level(FAN_PIN, 1);
+                gpio_set_level(BUZZER_PIN, 0);
+                window_set(WIN_OPEN_DEG);
+                beep_on = 0;
+                ESP_LOGI(TAG, "【烟雾报警】-> 绿灯亮 蜂鸣器静音 风扇开 开窗");
             } else {
-                // 无烟雾：灯灭 + 风扇关 + 蜂鸣器静音
+                // 正常：灯灭 + 风扇关 + 蜂鸣器静音 + 关窗
                 gpio_set_level(LED_R_PIN, 0);
                 gpio_set_level(LED_G_PIN, 0);
                 gpio_set_level(FAN_PIN, 0);
                 gpio_set_level(BUZZER_PIN, 0);
+                window_set(WIN_CLOSE_DEG);
                 beep_on = 0;
-                ESP_LOGI(TAG, "【正常】无烟雾 -> 灯灭 风扇关 蜂鸣器静音");
+                ESP_LOGI(TAG, "【正常】烟雾和火焰都消失 -> 灯灭 风扇关 蜂鸣器静音 关窗");
             }
         }
 
-        // 报警期间蜂鸣器间歇鸣叫：响 500ms / 停 500ms（主循环 10ms 一拍）
-        if (alarm_state == 1) {
+        // 只有火焰报警期间蜂鸣器间歇鸣叫：响 500ms / 停 500ms（主循环 10ms 一拍）
+        if (alarm_state == 2) {
             beep_tick++;
             if (beep_tick >= 50) {
                 beep_tick = 0;
@@ -201,7 +357,7 @@ void app_main(void)
             }
         }
 
-        // 调试：每秒打印一次 PIR / MQ-2 原始电平
+        // 调试：每秒打印一次各传感器原始电平
         static int pir_dbg_tick = 0;
         pir_dbg_tick++;
         if (pir_dbg_tick >= 100) {
@@ -209,6 +365,8 @@ void app_main(void)
             ESP_LOGI(TAG, "PIR 原始电平 = %d", pir);
             ESP_LOGI(TAG, "MQ-2 原始电平 = %d -> %s", mq2_raw,
                      smoke ? "报警" : "正常");
+            ESP_LOGI(TAG, "火焰 DO = %d -> %s，AO = %d mV", flame_do,
+                     flame ? "有火焰" : "无火焰", ao_mv);
         }
 
         if(my_wifi_info.flag == 1){
@@ -228,17 +386,17 @@ void app_main(void)
             lv_label_set_text(guider_ui.counter_label_eth_ip, "broker.emqx.io");
         }
 
-        // 每 5 秒上报一次（温湿度仍为模拟值，烟雾为真实传感器）
+        // 每 5 秒上报一次（温湿度仍为模拟值，烟雾/火焰/人体为真实传感器）
         sensor_tick++;
         if (sensor_tick >= 500) {
             sensor_tick = 0;
             int t = 200 + (esp_random() % 150);   // 20.0 ~ 34.9 ℃
             int h = 400 + (esp_random() % 400);   // 40.0 ~ 79.9 %
 
-            char payload[128];
+            char payload[160];
             snprintf(payload, sizeof(payload),
-                     "{\"temp\":%d.%d,\"hum\":%d.%d,\"smoke\":%d,\"hat\":%d,\"pir\":%d}",
-                     t/10, t%10, h/10, h%10, smoke, hat, pir);
+                     "{\"temp\":%d.%d,\"hum\":%d.%d,\"smoke\":%d,\"hat\":%d,\"pir\":%d,\"flame\":%d}",
+                     t/10, t%10, h/10, h%10, smoke, hat, pir, flame);
             app_mqtt_publish(MQTT_PUB_TOPIC, payload, strlen(payload));
             ESP_LOGI(TAG, "上报 %s", payload);
 
@@ -247,9 +405,9 @@ void app_main(void)
             lv_label_set_text(guider_ui.counter_label_tf_state, buf);
             snprintf(buf, sizeof(buf), "Humi:%d.%d%%", h/10, h%10);
             lv_label_set_text(guider_ui.counter_label_tf_rw, buf);
-            // 最后一行显示烟雾报警 + 人体红外状态
-            snprintf(buf, sizeof(buf), "SMK:%s PIR:%s",
-                     smoke ? "ALM" : "OK", pir ? "Y" : "N");
+            // 最后一行显示 烟雾 / 火焰 / 人体 状态（缩写避免超出屏幕宽度）
+            snprintf(buf, sizeof(buf), "S:%s F:%s P:%s",
+                     smoke ? "ALM" : "OK", flame ? "ALM" : "OK", pir ? "Y" : "N");
             lv_label_set_text(guider_ui.counter_label_gpio, buf);
         }
 
