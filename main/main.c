@@ -25,6 +25,7 @@
 #include "app_gpio.h"
 #include "main_mqtt.h"
 #include "app_uart.h"
+#include "sht30.h"
 
 /* WiFi 账号密码放在 main/wifi_config.h 里，该文件已被 .gitignore 忽略
    克隆本仓库后请把 wifi_config.h.example 复制成 wifi_config.h 并填写自己的账号 */
@@ -39,7 +40,7 @@ static const char *TAG = "main output";
 
 #define MQTT_PUB_TOPIC "aibot/esp32s3/status"
 
-// HC-SR501 人体红外传感器接 GPIO5
+// LD2410C-P 24GHz 人体存在感应雷达：OUT 接 GPIO5（高电平=有人）
 #define PIR_PIN GPIO_NUM_5
 // 继电器（控制风扇）接 GPIO6
 #define FAN_PIN GPIO_NUM_6
@@ -206,7 +207,7 @@ void app_main(void)
     //UART1 初始化（接收 K230 视觉模块的安全帽检测结果）
     app_uart_init();
 
-    // HC-SR501 人体红外传感器初始化
+    // LD2410C-P 人体存在感应雷达初始化（只用 OUT 电平，TX/RX 悬空）
     gpio_config_t pir_conf = {
         .pin_bit_mask = (1ULL << PIR_PIN),
         .mode = GPIO_MODE_INPUT,
@@ -215,7 +216,7 @@ void app_main(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&pir_conf);
-    ESP_LOGI(TAG, "PIR(HC-SR501) 初始化完成，引脚 GPIO%d", PIR_PIN);
+    ESP_LOGI(TAG, "人体雷达(LD2410C-P) 初始化完成，OUT 引脚 GPIO%d", PIR_PIN);
 
     // 继电器（控制风扇）初始化
     gpio_config_t fan_conf = {
@@ -271,6 +272,11 @@ void app_main(void)
     // 双舵机初始化（报警时开窗）
     servo_init();
 
+    // SHT30 温湿度传感器初始化（I2C：SDA=GPIO41，SCL=GPIO42）
+    if (sht30_init() != ESP_OK) {
+        ESP_LOGE(TAG, "SHT30 初始化失败，温湿度将显示为 0");
+    }
+
     // 以下官方工厂测试函数已注释：无 SD 卡时 app_sd_card 会阻塞导致看门狗复位
     // app_eth();
     // app_sd_card();
@@ -282,12 +288,20 @@ void app_main(void)
     int beep_on = 0;        // 蜂鸣器当前是否在响
     int ao_tick = 0;        // 火焰 AO 采样分频
     int ao_mv = 0;          // 火焰 AO 电压（mV）
+    int pir_last = -1;      // 上一次的人体检测状态：-1=未初始化，0=无人，1=有人
+    float last_temp = 0.0f; // 最近一次有效的 SHT30 温度
+    float last_hum = 0.0f;  // 最近一次有效的 SHT30 湿度
 
     while (true) {
         // 读取 K230 发来的安全帽检测结果
         int hat = app_uart_get_hat();
-        // 读取 HC-SR501 人体红外：1=有人，0=无人
+        // 读取 LD2410C-P 人体雷达 OUT：1=有人，0=无人
         int pir = gpio_get_level(PIR_PIN);
+        // 人体状态一变化立刻打印（主循环 10ms 一拍）
+        if (pir != pir_last) {
+            pir_last = pir;
+            ESP_LOGI(TAG, "【人体检测】%s（电平 %d）", pir ? "有人" : "无人", pir);
+        }
         // 读取 MQ-2 烟雾传感器：0=检测到烟雾，1=正常
         int mq2_raw = gpio_get_level(MQ2_PIN);
         // 1=烟雾报警（真实传感器，低电平有效）
@@ -362,7 +376,7 @@ void app_main(void)
         pir_dbg_tick++;
         if (pir_dbg_tick >= 100) {
             pir_dbg_tick = 0;
-            ESP_LOGI(TAG, "PIR 原始电平 = %d", pir);
+            ESP_LOGI(TAG, "PIR 原始电平 = %d -> %s", pir, pir ? "有人" : "无人");
             ESP_LOGI(TAG, "MQ-2 原始电平 = %d -> %s", mq2_raw,
                      smoke ? "报警" : "正常");
             ESP_LOGI(TAG, "火焰 DO = %d -> %s，AO = %d mV", flame_do,
@@ -386,12 +400,22 @@ void app_main(void)
             lv_label_set_text(guider_ui.counter_label_eth_ip, "broker.emqx.io");
         }
 
-        // 每 5 秒上报一次（温湿度仍为模拟值，烟雾/火焰/人体为真实传感器）
+        // 每 5 秒上报一次（温湿度来自 SHT30 实测，其余为真实传感器）
         sensor_tick++;
         if (sensor_tick >= 500) {
             sensor_tick = 0;
-            int t = 200 + (esp_random() % 150);   // 20.0 ~ 34.9 ℃
-            int h = 400 + (esp_random() % 400);   // 40.0 ~ 79.9 %
+
+            // 读 SHT30；读失败就沿用上一次的有效值，避免数值乱跳
+            float tc = 0.0f, rh = 0.0f;
+            if (sht30_read(&tc, &rh) == ESP_OK) {
+                last_temp = tc;
+                last_hum = rh;
+            } else {
+                ESP_LOGW(TAG, "SHT30 读取失败，沿用上一次数值 %.1fC / %.1f%%",
+                         last_temp, last_hum);
+            }
+            int t = (int)(last_temp * 10.0f + 0.5f);
+            int h = (int)(last_hum * 10.0f + 0.5f);
 
             char payload[160];
             snprintf(payload, sizeof(payload),
