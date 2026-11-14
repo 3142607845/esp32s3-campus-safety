@@ -5,9 +5,8 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 
-#define SHT_I2C_PORT    I2C_NUM_0
-#define SHT_SDA_GPIO    GPIO_NUM_41
-#define SHT_SCL_GPIO    GPIO_NUM_42
+#include "i2c_bus.h"
+
 #define SHT_I2C_HZ      100000
 
 #define SHT_ADDR_LOW    0x44
@@ -15,7 +14,6 @@
 
 static const char *TAG = "sht30";
 
-static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 
 /* SHT3x 数据 CRC8：多项式 0x31，初值 0xFF */
@@ -33,24 +31,20 @@ static uint8_t sht_crc8(const uint8_t *data, int len)
 
 esp_err_t sht30_init(void)
 {
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = SHT_I2C_PORT,
-        .sda_io_num = SHT_SDA_GPIO,
-        .scl_io_num = SHT_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_bus);
+    esp_err_t err = i2c_bus_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 总线初始化失败：%s", esp_err_to_name(err));
         return err;
     }
 
+    i2c_master_bus_handle_t bus = i2c_bus_get();
+    if (bus == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t addr = 0;
-    if (i2c_master_probe(s_bus, SHT_ADDR_LOW, 100) == ESP_OK) {
+    if (i2c_master_probe(bus, SHT_ADDR_LOW, 100) == ESP_OK) {
         addr = SHT_ADDR_LOW;
-    } else if (i2c_master_probe(s_bus, SHT_ADDR_HIGH, 100) == ESP_OK) {
+    } else if (i2c_master_probe(bus, SHT_ADDR_HIGH, 100) == ESP_OK) {
         addr = SHT_ADDR_HIGH;
     } else {
         ESP_LOGE(TAG, "未找到传感器（0x44 / 0x45 无应答），检查 SDA/SCL 与供电");
@@ -62,14 +56,13 @@ esp_err_t sht30_init(void)
         .device_address = addr,
         .scl_speed_hz = SHT_I2C_HZ,
     };
-    err = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
+    err = i2c_master_bus_add_device(bus, &dev_cfg, &s_dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "添加 I2C 设备失败：%s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "初始化完成，地址 0x%02X，SDA=GPIO%d SCL=GPIO%d",
-             addr, SHT_SDA_GPIO, SHT_SCL_GPIO);
+    ESP_LOGI(TAG, "初始化完成，地址 0x%02X", addr);
     return ESP_OK;
 }
 

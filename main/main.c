@@ -26,6 +26,7 @@
 #include "main_mqtt.h"
 #include "app_uart.h"
 #include "sht30.h"
+#include "sgp30.h"
 
 /* WiFi 账号密码放在 main/wifi_config.h 里，该文件已被 .gitignore 忽略
    克隆本仓库后请把 wifi_config.h.example 复制成 wifi_config.h 并填写自己的账号 */
@@ -277,6 +278,11 @@ void app_main(void)
         ESP_LOGE(TAG, "SHT30 初始化失败，温湿度将显示为 0");
     }
 
+    // SGP30 气体传感器初始化（与 SHT30 共用 I2C 总线，地址 0x58）
+    if (sgp30_init() != ESP_OK) {
+        ESP_LOGE(TAG, "SGP30 初始化失败，eCO2/TVOC 将显示为 0");
+    }
+
     // 以下官方工厂测试函数已注释：无 SD 卡时 app_sd_card 会阻塞导致看门狗复位
     // app_eth();
     // app_sd_card();
@@ -291,6 +297,10 @@ void app_main(void)
     int pir_last = -1;      // 上一次的人体检测状态：-1=未初始化，0=无人，1=有人
     float last_temp = 0.0f; // 最近一次有效的 SHT30 温度
     float last_hum = 0.0f;  // 最近一次有效的 SHT30 湿度
+    int sgp_tick = 0;       // SGP30 每秒测量一次的计时
+    uint16_t eco2 = 0;      // 最近一次 eCO2（ppm）
+    uint16_t tvoc = 0;      // 最近一次 TVOC（ppb）
+    bool sgp_valid = false; // SGP30 是否成功读到过数据
 
     while (true) {
         // 读取 K230 发来的安全帽检测结果
@@ -400,7 +410,19 @@ void app_main(void)
             lv_label_set_text(guider_ui.counter_label_eth_ip, "broker.emqx.io");
         }
 
-        // 每 5 秒上报一次（温湿度来自 SHT30 实测，其余为真实传感器）
+        // SGP30 要求约 1 秒测量一次（主循环 10ms 一拍，100 拍 = 1 秒）
+        sgp_tick++;
+        if (sgp_tick >= 100) {
+            sgp_tick = 0;
+            uint16_t e = 0, v = 0;
+            if (sgp30_read(&e, &v) == ESP_OK) {
+                eco2 = e;
+                tvoc = v;
+                sgp_valid = true;
+            }
+        }
+
+        // 每 5 秒上报一次（温湿度来自 SHT30 实测，eCO2/TVOC 来自 SGP30）
         sensor_tick++;
         if (sensor_tick >= 500) {
             sensor_tick = 0;
@@ -419,10 +441,16 @@ void app_main(void)
 
             char payload[160];
             snprintf(payload, sizeof(payload),
-                     "{\"temp\":%d.%d,\"hum\":%d.%d,\"smoke\":%d,\"hat\":%d,\"pir\":%d,\"flame\":%d}",
-                     t/10, t%10, h/10, h%10, smoke, hat, pir, flame);
+                     "{\"temp\":%d.%d,\"hum\":%d.%d,\"eco2\":%u,\"tvoc\":%u,"
+                     "\"smoke\":%d,\"hat\":%d,\"pir\":%d,\"flame\":%d}",
+                     t/10, t%10, h/10, h%10, eco2, tvoc, smoke, hat, pir, flame);
             app_mqtt_publish(MQTT_PUB_TOPIC, payload, strlen(payload));
             ESP_LOGI(TAG, "上报 %s", payload);
+            if (sgp_valid) {
+                ESP_LOGI(TAG, "SGP30 eCO2=%u ppm  TVOC=%u ppb", eco2, tvoc);
+            } else {
+                ESP_LOGW(TAG, "SGP30 无数据（0x58 未识别或读取失败），eco2/tvoc 保持 0");
+            }
 
             char buf[48];
             snprintf(buf, sizeof(buf), "Temp:%d.%dC", t/10, t%10);
