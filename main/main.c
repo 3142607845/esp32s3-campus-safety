@@ -70,6 +70,14 @@ static const char *TAG = "main output";
 #define WIN_CLOSE_DEG  0                   /* 关窗角度 */
 #define WIN_OPEN_DEG   90                  /* 开窗角度 */
 
+/* 本地火焰传感器报警时的动作节奏（用来和 K230 视觉报警区分） */
+#define LED_BLINK_MS   500     /* 红绿交替闪烁的间隔 */
+#define BEEP_PERIOD_MS 3000    /* 蜂鸣器每隔 3 秒叫一次 */
+#define BEEP_ON_MS     500     /* 每次叫 500ms */
+
+/* 窗户控制：无烟无火必须持续这么久才关窗，防止识别跳动导致一开一关 */
+#define WIN_CLOSE_DELAY_MS 10000
+
 TaskHandle_t  task_handle_gui;
 esp_timer_create_args_t timer_args_gui;
 esp_timer_handle_t timer_handle_gui;
@@ -289,9 +297,12 @@ void app_main(void)
     // app_gpio();
 
     int sensor_tick = 0;
-    int alarm_state = -1;   // 上一次的报警状态：-1=未初始化，0=正常，1=报警
-    int beep_tick = 0;      // 蜂鸣器间歇鸣叫计时
-    int beep_on = 0;        // 蜂鸣器当前是否在响
+    int alarm_state = -1;   // 上一次的报警状态：-1=未初始化，0=正常，1=烟雾，2=本地火焰，3=K230 火焰
+    int led_tick = 0;       // 本地火焰报警时红绿交替计时（10ms 一拍）
+    int led_phase = 0;      // 0=红灯亮，1=绿灯亮
+    int beep_tick = 0;      // 本地火焰报警时蜂鸣器计时（10ms 一拍）
+    int win_tick = 0;       // 无烟无火的持续计时（10ms 一拍）
+    bool win_open = false;  // 窗户当前是否已经打开
     int ao_tick = 0;        // 火焰 AO 采样分频
     int ao_mv = 0;          // 火焰 AO 电压（mV）
     int pir_last = -1;      // 上一次的人体检测状态：-1=未初始化，0=无人，1=有人
@@ -303,8 +314,8 @@ void app_main(void)
     bool sgp_valid = false; // SGP30 是否成功读到过数据
 
     while (true) {
-        // 读取 K230 发来的安全帽检测结果
-        int hat = app_uart_get_hat();
+        // 读取 K230 发来的火焰检测结果：1=识别到火焰，0=无火焰，-1=未收到数据
+        int aifire = app_uart_get_fire();
         // 读取 LD2410C-P 人体雷达 OUT：1=有人，0=无人
         int pir = gpio_get_level(PIR_PIN);
         // 人体状态一变化立刻打印（主循环 10ms 一拍）
@@ -318,7 +329,8 @@ void app_main(void)
         int smoke = (mq2_raw == 0) ? 1 : 0;
         // 读取火焰传感器 DO：0=检测到火焰，1=正常
         int flame_do = gpio_get_level(FLAME_DO_PIN);
-        int flame = (flame_do == 0) ? 1 : 0;
+        // 本地火焰传感器 或 K230 视觉识别，任一判定有火就进入火焰报警
+        int flame = ((flame_do == 0) || (aifire == 1)) ? 1 : 0;
 
         // 火焰 AO 每 100ms 采一次（只用于日志观察强弱，报警判断仍用 DO）
         ao_tick++;
@@ -331,53 +343,91 @@ void app_main(void)
             }
         }
 
-        // ===== 报警联动：火焰优先 =====
-        //   2 = 检测到火焰（红灯 + 蜂鸣器）
-        //   1 = 只检测到烟雾（绿灯，蜂鸣器不响）
+        // ===== 报警联动：K230 视觉火焰 > 本地火焰传感器 > 烟雾 =====
+        //   3 = K230 识别到火焰（红灯常亮 + 蜂鸣器长鸣）
+        //   2 = 本地火焰传感器触发（红绿交替闪烁 + 蜂鸣器每 3 秒响一次）
+        //   1 = 只检测到烟雾（绿灯常亮，蜂鸣器不响）
         //   0 = 正常（灯不亮，蜂鸣器不响）
-        int alarm = flame ? 2 : (smoke ? 1 : 0);
+        int alarm;
+        if (aifire == 1) {
+            alarm = 3;
+        } else if (flame_do == 0) {
+            alarm = 2;
+        } else {
+            alarm = smoke ? 1 : 0;
+        }
 
         if (alarm != alarm_state) {
             alarm_state = alarm;
-            if (alarm == 2) {
-                // 火焰：红灯亮 + 绿色灭 + 蜂鸣器响 + 风扇开 + 开窗
+            led_tick = 0;
+            led_phase = 0;
+            beep_tick = 0;
+            if (alarm == 3) {
+                // K230 视觉火焰：红灯常亮 + 蜂鸣器长鸣 + 风扇开 + 开窗
                 gpio_set_level(LED_R_PIN, 1);
                 gpio_set_level(LED_G_PIN, 0);
                 gpio_set_level(FAN_PIN, 1);
                 gpio_set_level(BUZZER_PIN, 1);
-                window_set(WIN_OPEN_DEG);
-                beep_tick = 0;
-                beep_on = 1;
-                ESP_LOGW(TAG, "【火焰报警】烟雾=%d 火焰=%d -> 红灯亮 蜂鸣器响 风扇开 开窗",
-                         smoke, flame);
+                ESP_LOGW(TAG, "【K230火焰报警】视觉识别到火焰 -> 红灯常亮 蜂鸣器长鸣 风扇开");
+            } else if (alarm == 2) {
+                // 本地火焰传感器：红绿交替（初始红灯亮）+ 蜂鸣器开始计时 + 风扇开 + 开窗
+                gpio_set_level(LED_R_PIN, 1);
+                gpio_set_level(LED_G_PIN, 0);
+                gpio_set_level(FAN_PIN, 1);
+                gpio_set_level(BUZZER_PIN, 1);
+                ESP_LOGW(TAG, "【本地火焰报警】火焰传感器触发 -> 红绿交替闪烁 蜂鸣器每 %d 秒响一次",
+                         BEEP_PERIOD_MS / 1000);
             } else if (alarm == 1) {
-                // 只有烟雾：绿灯亮 + 红色灭 + 蜂鸣器静音 + 风扇开 + 开窗
+                // 只有烟雾：绿灯常亮 + 红色灭 + 蜂鸣器静音 + 风扇开 + 开窗
                 gpio_set_level(LED_R_PIN, 0);
                 gpio_set_level(LED_G_PIN, 1);
                 gpio_set_level(FAN_PIN, 1);
                 gpio_set_level(BUZZER_PIN, 0);
-                window_set(WIN_OPEN_DEG);
-                beep_on = 0;
-                ESP_LOGI(TAG, "【烟雾报警】-> 绿灯亮 蜂鸣器静音 风扇开 开窗");
+                ESP_LOGI(TAG, "【烟雾报警】-> 绿灯亮 蜂鸣器静音 风扇开");
             } else {
                 // 正常：灯灭 + 风扇关 + 蜂鸣器静音 + 关窗
                 gpio_set_level(LED_R_PIN, 0);
                 gpio_set_level(LED_G_PIN, 0);
                 gpio_set_level(FAN_PIN, 0);
                 gpio_set_level(BUZZER_PIN, 0);
-                window_set(WIN_CLOSE_DEG);
-                beep_on = 0;
-                ESP_LOGI(TAG, "【正常】烟雾和火焰都消失 -> 灯灭 风扇关 蜂鸣器静音 关窗");
+                ESP_LOGI(TAG, "【正常】烟雾和火焰都消失 -> 灯灭 风扇关 蜂鸣器静音");
             }
         }
 
-        // 只有火焰报警期间蜂鸣器间歇鸣叫：响 500ms / 停 500ms（主循环 10ms 一拍）
+        // ===== 报警期间的状态灯 / 蜂鸣器动作 =====
         if (alarm_state == 2) {
+            // 本地火焰：红灯 / 绿灯每 500ms 交替一次
+            led_tick++;
+            if (led_tick >= LED_BLINK_MS / 10) {
+                led_tick = 0;
+                led_phase = !led_phase;
+                gpio_set_level(LED_R_PIN, led_phase ? 0 : 1);
+                gpio_set_level(LED_G_PIN, led_phase ? 1 : 0);
+            }
+            // 本地火焰：每 3 秒短叫 500ms
             beep_tick++;
-            if (beep_tick >= 50) {
+            if (beep_tick >= BEEP_PERIOD_MS / 10) {
                 beep_tick = 0;
-                beep_on = !beep_on;
-                gpio_set_level(BUZZER_PIN, beep_on);
+            }
+            gpio_set_level(BUZZER_PIN, beep_tick < (BEEP_ON_MS / 10) ? 1 : 0);
+        }
+
+        // ===== 窗户控制（和报警灯解耦，避免识别跳动导致一开一关）=====
+        //   有烟/火：立即开窗，安全优先，不等 10 秒
+        //   无烟无火：必须连续 10 秒都干净才关窗，中途跳一下会重新计时
+        int danger = ((aifire == 1) || (flame_do == 0) || smoke) ? 1 : 0;
+        if (danger) {
+            win_tick = 0;
+            if (!win_open) {
+                window_set(WIN_OPEN_DEG);
+                win_open = true;
+            }
+        } else if (win_open) {
+            win_tick++;
+            if (win_tick >= WIN_CLOSE_DELAY_MS / 10) {
+                win_tick = 0;
+                window_set(WIN_CLOSE_DEG);
+                win_open = false;
             }
         }
 
@@ -389,8 +439,17 @@ void app_main(void)
             ESP_LOGI(TAG, "PIR 原始电平 = %d -> %s", pir, pir ? "有人" : "无人");
             ESP_LOGI(TAG, "MQ-2 原始电平 = %d -> %s", mq2_raw,
                      smoke ? "报警" : "正常");
-            ESP_LOGI(TAG, "火焰 DO = %d -> %s，AO = %d mV", flame_do,
-                     flame ? "有火焰" : "无火焰", ao_mv);
+            ESP_LOGI(TAG, "火焰 DO=%d，AO=%d mV，K230 状态=%d -> 报警状态=%d（%s） 窗户=%s",
+                     flame_do, ao_mv, aifire, alarm_state,
+                     alarm_state == 3 ? "K230火焰" :
+                     alarm_state == 2 ? "本地火焰" :
+                     alarm_state == 1 ? "烟雾" : "正常",
+                     win_open ? "开" : "关");
+            if (win_open && !danger) {
+                ESP_LOGI(TAG, "无烟无火已持续 %d.%d 秒，满 %d 秒后关窗",
+                         win_tick / 100, win_tick % 100,
+                         WIN_CLOSE_DELAY_MS / 1000);
+            }
         }
 
         if(my_wifi_info.flag == 1){
@@ -442,8 +501,8 @@ void app_main(void)
             char payload[160];
             snprintf(payload, sizeof(payload),
                      "{\"temp\":%d.%d,\"hum\":%d.%d,\"eco2\":%u,\"tvoc\":%u,"
-                     "\"smoke\":%d,\"hat\":%d,\"pir\":%d,\"flame\":%d}",
-                     t/10, t%10, h/10, h%10, eco2, tvoc, smoke, hat, pir, flame);
+                     "\"smoke\":%d,\"aifire\":%d,\"pir\":%d,\"flame\":%d}",
+                     t/10, t%10, h/10, h%10, eco2, tvoc, smoke, aifire, pir, flame);
             app_mqtt_publish(MQTT_PUB_TOPIC, payload, strlen(payload));
             ESP_LOGI(TAG, "上报 %s", payload);
             if (sgp_valid) {
