@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -93,6 +94,10 @@ extern MY_MQTT_INFO my_mqtt_info;
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_adc_cali = NULL;
 
+/* LVGL 互斥锁：app_main（CPU0）和 lv_run_task（CPU1）都会操作 LVGL 对象，
+ * LVGL 非线程安全，必须加锁，否则会竞态导致渲染死循环、触发 Task Watchdog */
+static SemaphoreHandle_t s_lvgl_mutex = NULL;
+
 static void lv_tick_task(void *arg)
 {
     lv_tick_inc(1);
@@ -100,7 +105,10 @@ static void lv_tick_task(void *arg)
 void lv_run_task(void *arg)
 {
     while (true) {
-        lv_task_handler();
+        if (xSemaphoreTake(s_lvgl_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            lv_task_handler();
+            xSemaphoreGive(s_lvgl_mutex);
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -206,6 +214,8 @@ void app_main(void)
     timer_args_gui.name = "periodic_gui";
     ESP_ERROR_CHECK(esp_timer_create(&timer_args_gui, &timer_handle_gui));
     ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle_gui, 1 * 1000));
+
+    s_lvgl_mutex = xSemaphoreCreateMutex();
 
     BaseType_t status = xTaskCreate(lv_run_task, "lv_run_task", 4096, NULL, 2, &task_handle_gui);
     if (status == pdPASS) {
@@ -326,6 +336,12 @@ void app_main(void)
     bool sgp_valid = false; // SGP30 是否成功读到过数据
     int card_count = 0;     // 累计刷卡次数（每次读到一张新卡 +1）
 
+    /* 屏幕报警显示锁存：传感器短脉冲（几十 ms）也要在屏幕上至少保持 2 秒，
+     * 否则 500ms 刷新一次的屏幕根本来不及显示报警状态 */
+    int disp_alarm = 0;         // 锁存的报警类型：0正常 1烟雾 2本地火焰 3K230火焰
+    int disp_alarm_hold = 0;    // 报警消失后的保持计时（10ms 一拍）
+    int screen_tick = 0;        // 屏幕状态行刷新计时（10ms 一拍，50 拍 = 500ms）
+
     while (true) {
         // 读取 K230 发来的火焰检测结果：1=识别到火焰，0=无火焰，-1=未收到数据
         int aifire = app_uart_get_fire();
@@ -375,6 +391,17 @@ void app_main(void)
             alarm = 2;
         } else {
             alarm = smoke ? 1 : 0;
+        }
+
+        // 报警显示锁存：有报警立即更新；报警消失后保持 2 秒再清零
+        if (alarm > 0) {
+            disp_alarm = alarm;
+            disp_alarm_hold = 0;
+        } else if (disp_alarm > 0) {
+            disp_alarm_hold++;
+            if (disp_alarm_hold >= 200) {   // 200 × 10ms = 2 秒
+                disp_alarm = 0;
+            }
         }
 
         if (alarm != alarm_state) {
@@ -477,19 +504,23 @@ void app_main(void)
 
         if(my_wifi_info.flag == 1){
             my_wifi_info.flag = 0;
+            xSemaphoreTake(s_lvgl_mutex, portMAX_DELAY);
             lv_obj_set_style_bg_color(guider_ui.counter_label_wifi_state,
                     lv_color_hex(0xff00), LV_PART_MAIN|LV_STATE_DEFAULT); // @suppress("Symbol is not resolved")
             lv_label_set_text(guider_ui.counter_label_wifi_state, "WIFI状态:OK");
             lv_label_set_text(guider_ui.counter_label_wifi_ip, my_wifi_info.ip_string);
+            xSemaphoreGive(s_lvgl_mutex);
         }
 
         // MQTT 状态显示（复用 ETH 的 label 位置）
         if(my_mqtt_info.flag == 1){
             my_mqtt_info.flag = 0;
+            xSemaphoreTake(s_lvgl_mutex, portMAX_DELAY);
             lv_obj_set_style_bg_color(guider_ui.counter_label_eth_state,
                     lv_color_hex(0xff00), LV_PART_MAIN|LV_STATE_DEFAULT);
             lv_label_set_text(guider_ui.counter_label_eth_state, "MQTT状态:OK");
             lv_label_set_text(guider_ui.counter_label_eth_ip, "broker.emqx.io");
+            xSemaphoreGive(s_lvgl_mutex);
         }
 
         // SGP30 要求约 1 秒测量一次（主循环 10ms 一拍，100 拍 = 1 秒）
@@ -536,13 +567,26 @@ void app_main(void)
 
             char buf[48];
             snprintf(buf, sizeof(buf), "Temp:%d.%dC", t/10, t%10);
+            xSemaphoreTake(s_lvgl_mutex, portMAX_DELAY);
             lv_label_set_text(guider_ui.counter_label_tf_state, buf);
             snprintf(buf, sizeof(buf), "Humi:%d.%d%%", h/10, h%10);
             lv_label_set_text(guider_ui.counter_label_tf_rw, buf);
-            // 最后一行显示 烟雾 / 火焰 / 人体 状态（缩写避免超出屏幕宽度）
-            snprintf(buf, sizeof(buf), "S:%s F:%s P:%s",
-                     smoke ? "ALM" : "OK", flame ? "ALM" : "OK", pir ? "Y" : "N");
-            lv_label_set_text(guider_ui.counter_label_gpio, buf);
+            xSemaphoreGive(s_lvgl_mutex);
+        }
+
+        // 屏幕状态行每 500ms 刷新一次：S=烟雾 F=火焰 P=人体
+        // S/F 用锁存的报警状态判断（短脉冲也能保持显示 2 秒）
+        screen_tick++;
+        if (screen_tick >= 50) {
+            screen_tick = 0;
+            char sbuf[48];
+            snprintf(sbuf, sizeof(sbuf), "S:%s F:%s P:%s",
+                     (disp_alarm == 1) ? "NO" : "OK",
+                     (disp_alarm >= 2) ? "NO" : "OK",
+                     pir ? "Y" : "N");
+            xSemaphoreTake(s_lvgl_mutex, portMAX_DELAY);
+            lv_label_set_text(guider_ui.counter_label_gpio, sbuf);
+            xSemaphoreGive(s_lvgl_mutex);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
