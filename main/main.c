@@ -27,6 +27,7 @@
 #include "app_uart.h"
 #include "sht30.h"
 #include "sgp30.h"
+#include "app_rc522.h"
 
 /* WiFi 账号密码放在 main/wifi_config.h 里，该文件已被 .gitignore 忽略
    克隆本仓库后请把 wifi_config.h.example 复制成 wifi_config.h 并填写自己的账号 */
@@ -291,6 +292,11 @@ void app_main(void)
         ESP_LOGE(TAG, "SGP30 初始化失败，eCO2/TVOC 将显示为 0");
     }
 
+    // RC522 射频读卡模块初始化（SPI2：SCK=GPIO12 MOSI=GPIO11 MISO=GPIO3 CS=GPIO48，RST 接 3.3V）
+    if (app_rc522_init() != ESP_OK) {
+        ESP_LOGE(TAG, "RC522 初始化失败，刷卡功能不可用");
+    }
+
     // 以下官方工厂测试函数已注释：无 SD 卡时 app_sd_card 会阻塞导致看门狗复位
     // app_eth();
     // app_sd_card();
@@ -331,6 +337,12 @@ void app_main(void)
         int flame_do = gpio_get_level(FLAME_DO_PIN);
         // 本地火焰传感器 或 K230 视觉识别，任一判定有火就进入火焰报警
         int flame = ((flame_do == 0) || (aifire == 1)) ? 1 : 0;
+
+        // 轮询 RC522 射频卡：读到一张新卡时返回 UID（同一张卡持续放置只上报一次）
+        char card_uid[9];
+        if (app_rc522_poll(card_uid, sizeof(card_uid))) {
+            ESP_LOGI(TAG, "【刷卡】UID=%s", card_uid);
+        }
 
         // 火焰 AO 每 100ms 采一次（只用于日志观察强弱，报警判断仍用 DO）
         ao_tick++;
