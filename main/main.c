@@ -28,6 +28,7 @@
 #include "sht30.h"
 #include "sgp30.h"
 #include "app_rc522.h"
+#include "app_oled.h"
 
 /* WiFi 账号密码放在 main/wifi_config.h 里，该文件已被 .gitignore 忽略
    克隆本仓库后请把 wifi_config.h.example 复制成 wifi_config.h 并填写自己的账号 */
@@ -297,6 +298,11 @@ void app_main(void)
         ESP_LOGE(TAG, "RC522 初始化失败，刷卡功能不可用");
     }
 
+    // 第二块显示屏：1.3 寸 OLED（与 SHT30/SGP30 共用 I2C：SDA=GPIO41 SCL=GPIO42）
+    if (app_oled_init() != ESP_OK) {
+        ESP_LOGE(TAG, "OLED 初始化失败，状态屏不可用");
+    }
+
     // 以下官方工厂测试函数已注释：无 SD 卡时 app_sd_card 会阻塞导致看门狗复位
     // app_eth();
     // app_sd_card();
@@ -318,6 +324,7 @@ void app_main(void)
     uint16_t eco2 = 0;      // 最近一次 eCO2（ppm）
     uint16_t tvoc = 0;      // 最近一次 TVOC（ppb）
     bool sgp_valid = false; // SGP30 是否成功读到过数据
+    int card_count = 0;     // 累计刷卡次数（每次读到一张新卡 +1）
 
     while (true) {
         // 读取 K230 发来的火焰检测结果：1=识别到火焰，0=无火焰，-1=未收到数据
@@ -341,7 +348,8 @@ void app_main(void)
         // 轮询 RC522 射频卡：读到一张新卡时返回 UID（同一张卡持续放置只上报一次）
         char card_uid[9];
         if (app_rc522_poll(card_uid, sizeof(card_uid))) {
-            ESP_LOGI(TAG, "【刷卡】UID=%s", card_uid);
+            card_count++;
+            ESP_LOGI(TAG, "【刷卡】UID=%s，累计 %d 次", card_uid, card_count);
         }
 
         // 火焰 AO 每 100ms 采一次（只用于日志观察强弱，报警判断仍用 DO）
@@ -442,6 +450,9 @@ void app_main(void)
                 win_open = false;
             }
         }
+
+        // 第二块屏幕：风扇 / 窗户 / 刷卡次数（内容变化时才刷屏）
+        app_oled_show_status(alarm_state > 0, win_open, card_count);
 
         // 调试：每秒打印一次各传感器原始电平
         static int pir_dbg_tick = 0;
